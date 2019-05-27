@@ -1,6 +1,6 @@
-# ARPA2 Service Directory
+# ARPA2 Service Directory Information Tree
 
-> *The ARPA2 Service Directory stores configuration settings in one or more
+> *The ARPA2 Service DIT stores configuration settings in one or more
 > LDAP servers following a format that is both standard and open.*
 
 LDAP is a useful component for configuration data, especially with the

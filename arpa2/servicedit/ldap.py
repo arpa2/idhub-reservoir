@@ -1,7 +1,18 @@
-# The default backend for ServiceDIR is LDAP, below.  This makes most
+# The default backend for ServiceDIT is LDAP, below.  This makes most
 # sense for our initial target of a hosting environment.  It is not
 # unthinkable that alternative backends would be created later, such
 # as through the configparser module that works on .INI style files.
+
+# Such choices would presumably be made before deployment time,
+# perhaps when selecting what packages to install.  A variant based
+# on configparser.ConfigParser could then be a drop-in alternative
+# that implements the LDAP model in simpler (and less powerful) code.
+
+# The code below is full of assert() statements, so as to refuse any
+# miss-assumptions about how this (fairly abstract) class is meant to
+# be used.  Though disruptive, this is intended to give very clear
+# guidance to programmers building extensions to this module.  Effort
+# went into making the assertion statements readable as repair hints.
 
 
 import weakref
@@ -11,18 +22,20 @@ import re
 import ldap
 
 
-varnm_re = re.compile ('^[a-zA-Z0-9_-.]+$')
+varnm_re = re.compile ('^[a-zA-Z0-9-_.]+$')
 dnval_re = re.compile ('^[^=,+]+$')
 
 cfgln_re = re.compile ('^([A-Z]+)[ \t]*(.*)$')
 whoam_re = re.compile ('^(?:dn: *)?uid=([^=,+]+),associatedDomain=([^=,+]+),.*$')
 
+# The location of the LDAP user configuration file
+#
+ldap_conf_file = '/etc/ldap/ldap.conf'
+
 
 class ConnectLDAP (object):
     """Connection to LDAP.  
     """
-
-    ldap_conf_file = '/etc/ldap/ldap.conf'
 
     def load_config (self):
         """Load the configuration in /etc/ldap/ldap.conf as a dictionary
@@ -103,43 +116,220 @@ class ConnectLDAP (object):
         self.login_gssapi (self.cfg_binddn ())
 
 
+class SyncLDAP (object):
+    """SyncLDAP objects synchronise with LDAP, and future versions may
+       collect changes in transactions.  SyncLDAP objects represent an
+       LDAP object for a particular application, so they line up with
+       a ServiceDIT object
+       
+       ou=<Application>,o=<ISPzone>,ou=InternetWide
+       
+       Directly underneath is the level of user domains, and a current
+       user domain can be maintained in this object as well as instances
+       created for each of those instances.  This results in a base
+       location that can be retrieved and for which nodes can be requested.
+       
+       There can be multiple clients with this same connection at the
+       same time, usually caused by separate attempts to operate on the
+       same application.  All nodes underneath this one would normally
+       be NodeSyncLDAP instances, but probably as a subclass thereof.
+       In fact, SyncLDAP is commonly subclassed by applications too.
+    """
+
+    def __init__ (self, ldapcnx, ispzone, service, basenodecls, userdomain=None):
+        """Wrap an LDAP connection to access a given service and optional
+           user domain.  You can get and set the user domain at any time,
+           but most data access functions assume that one has been setup.
+           The service is more like a static given; to switch between those,
+           you should create separate objects.
+           The base node class is the Python class that will be instantiated
+           to represent nodes for individual user domains.
+        """
+        assert (isinstance (basenode, cls))
+        self.ldapcnx = ldapcnx
+        self.ispzone = ispzone
+        self.service = service
+        self.dom2obj = weakref.WeakValueDictionary ()
+        self.basecls = basenodecls
+        self.set_userdomain (userdomain)
+
+    def set_userdomain (self, userdomain=None):
+        """Change what is used as the current user domain.
+           In spite of the dynamicity that this allows, child nodes that
+           were created for one user domain will continue to be shared
+           as long as the old uses exist.
+           
+           When None is provided for the user domain, it will be removed
+           and not all functions will work.
+        """
+        self.userdomain = userdomain
+
+    def get_userdomain (self):
+        """Retrieve the currently used user domain.  This may be None
+           if no user domain is currently setup.
+        """
+        return self.userdomain
+
+    def base_location (self):
+        """Return the node in the ServiceDIT representing the current domain
+           for the application setup when this object was initialised.
+        """
+        assert (self.userdomain is not None)
+        return 'associatedDomain=' + self.userdomain + ',ou=' + self.service + ',o=' + self.ispzone + ',ou=InternetWide'
+
+    def base_node (self):
+        """Return a Python object that references the ServiceDIT and share
+           it with any other objects currently active for the same node and
+           requested through this same SyncLDAP instance.  The object made
+           is an instance of the basenodecls that was provided during this
+           SyncLDAP initialisation.
+        """
+        assert (self.userdomain is not None)
+        basenode = self.dom2obj.get (self.userdomain, None)
+        if basenode is None:
+            basenode = self.basecls (self, self.base_location ())
+            self.dom2obj [self.userdomain] = basenode
+        return basenode
+
+    def resource_class (self):
+        """By default, SyncLDAP is not a resource class in ACL terms,
+           but this may be overridden in an application-specific subclass.
+           It should then return a lowercase UUID string that was fixed
+           for this application.
+        """
+        return None
+
+    def resource_instance (self):
+        """SyncLDAP sits too high up the ServiceDIT to ever be a resource
+           instance in ACL terms.  It should never return a key from this
+           function, and subclasses should not override this either.
+        """
+        raise Exception ('SyncLDAP objects can never be ACL resource instance')
+
+
 class NodeSyncLDAP (dict):
     """Node Sync LDAP objects support the retrieval of attributes
        and sub-nodes.  A Node Sync LDAP object may be present in memory
-       before it has been created, or after it has been deleted, to
-       collect state while building up a transaction.
+       before it has been created, or after it has been deleted.
+       
+       These objects can change attribute values, search for children,
+       and deliver new objects as application class instances, while
+       sharing them if an object is currently in use somewhere else.
+       
+       The current implementation simply acts on LDAP directly, but
+       future versions are expected to collect changes and commit
+       them in transactions.
     """
 
     def __init__ (self, topnode, location):
         self.master   = topnode
         self.location = location
-        self.vars_one = None
-        self.vars_lst = None
+        self.atnm_one = None
+        self.atnm_lst = None
+        self.attrvals = { }
         self.children = weakref.WeakValueDictionary ()
         self.loaded  = False
-        self.created = None
-        self.deleted = False
+        self.created = False
 
-    def set_variables (self, *singular_vars, list_vars=[]):
+    def set_variables (self, singular_attrs=[], list_attrs=[]):
         """Set the single-valued variables and list variabels that are of
            interest in this node.  Loading them is deferred to later.
-           You must call this operation exactly once.
+           You must call this operation exactly once.  This is mostly done
+           immediately after initialisation.  Most probably, it would be
+           called from a subclass's initialisation, where the desired
+           knowledge is available.
         """
-        assert (self.vars_one is None)
-        assert (self.vars_lst is None)
-        assert (self.loaded is False)
-        for varnm in singular_vars:
+        assert (self.atnm_one is None)
+        assert (self.atnm_lst is None)
+        assert (not self.loaded)
+        for varnm in singular_attrs:
             assert (varnm_re.match (varnm))
-        for varnm in list_vars:
+        for varnm in list_attrs:
             assert (varnm_re.match (varnm))
-        self.vars_one = singular_vars
-        self.vars_lst = list_vars
+        self.atnm_one = singular_attrs
+        self.atnm_lst = list_attrs
 
-    def load_vars (self):
+    def create (self, classes, attrs_dict):
+        """After preparing with set_variables, create a classes instance
+           with attributes from atnm_dict.  For list_vars, an iteratable
+           is expected to reveal all the attribute values.  Variables
+           not set during creation will not be created at all; there are
+           no default values but absense.
+           
+           This will also make calls to the methods resource_class()
+           and resource_instance() to see if these have been overridden
+           to supply additional information, which will then be added.
+        """
+        assert (not self.created)
+        assert (self.atnm_one is not None)
+        assert (self.atnm_lst is not None)
         assert (self.loaded is False)
-        assert (self.vars_one is not None)
-        assert (self.vars_lst is not None)
-        #TODO# Load into self.copy_one[] and self.wrap_lst[]
+        if isinstance (classes, str):
+            classes = [classes]
+        self.attrvals ['objectClass'] = classes [:]
+        rescls = self.resource_class ()
+        if rescls is not None:
+            self.attrvals ['resourceClassUUID'] = rescls
+            self.attrvals ['objectClass'].append ('resourceClassObject')
+        resins = self.resource_insance ()
+        if resins is not None:
+            self.attrvals ['resourceInstanceKey'] = resins
+            self.attrvals ['objectClass'].append ('resourceInstanceObject')
+        for (k,v) in atnm_dict.items ():
+            if k in self.atnm_one:
+                self.attrvals = v
+            elif k in self.atnm_lst:
+                self.attrvals = v [:]
+            else:
+                raise Exception ('Attribute %r unknown' % k)
+        self.ldapcnx.dap.add_s (self.location, self.attrvals)
+        self.created = True
+
+    def delete (self):
+        """Remove this object from LDAP.  It must exist, but need not have
+           had the create() or load_vars() methods invoked on it.  Having
+           said this, attempts to remove an object that does not exist in
+           LDAP will raise an exception.  The same is likely when children
+           of this node are present in storage.  When this call succeeds,
+           its attributes will have been reset and so it _may_ be recycled.
+        """
+        self.ldapcnx.dap.delete_s (self.location)
+        self.created = False
+        self.loaded  = False
+        self.attrvals = { }
+
+    def load_vars (self, classes, filterstr=None):
+        """Load the variabels as they are currently stored in LDAP.
+           This should be called after initialisation, for objects
+           that are not created from scratch.  Call set_variables
+           first, so that it is known what variables are of interest
+           in this place.
+        """
+        assert (not self.loaded)
+        assert (not self.created)
+        assert (self.atnm_one is not None)
+        assert (self.atnm_lst is not None)
+        atlist = self.atnm_one + self.atnm_lst
+        classflt = '(&' + ''.join (
+                    [ '(objectClass=' + cls + ')' for cls in classes]
+                    ) + ')'
+        print ('DEBUG: classflt', classflt)
+        if filterstr is not None:
+            combiflt = '(&' + classflt + filterstr + ')'
+        else:
+            combiflt = classflt
+        print ('DEBUG: combiflt', combiflt)
+        qr = self.ldapcnx.dap.search_s (self.location,
+                    ldap.SCOPE_BASE,
+                    filterstr=combiflt,
+                    attrlist=atlist)
+        print ('DEBUG: Query Result: %r' % qr)
+        [(_dn,entry)] = qr
+        for atnm in atnm_lst:
+            self.attrvals [atnm] = entry.get (atnm, [])
+        for atnm in atnm_one:
+            self.attrvals [atnm] = entry.get (atnm, [None]) [0]
+        self.loaded = True
 
     def get_value (self, varnm, dflt=None):
         """Get the singular value stored under a given varnm.  If it is not
@@ -147,10 +337,10 @@ class NodeSyncLDAP (dict):
            itself will be returned.  You can call set_value to update it
            at any time.
         """
-        assert (var in self.vars_one)
+        assert (var in self.atnm_one)
         if not self.loaded:
             self.load_vars ()
-        return self.copy_one [var] or dflt
+        return self.attrvals [var] or dflt
 
     def set_value (self, varnm, newval=None):
         """Set the singular value stored in a named variable.  If newval is
@@ -158,22 +348,47 @@ class NodeSyncLDAP (dict):
            The update will be stored for future processing, during an overall
            synchronisation of transaction state.
         """
-        assert (var in self.vars_one)
+        changes = [ ]
+        assert (varnm in self.atnm_one)
         if not self.loaded:
             self.load_vars ()
-        self.copy_one [var] = newval
+        oldval = self.attrvals [varnm]
+        if oldval [varnm] is not None:
+            changes.append ( (ldap.MOD_DELETE, self.location, oldval) )
+        self.attrvals [varnm] = newval
+        if newval is not None:
+            changes.append ( (ldap.MOD_ADD,    self.location, newval) )
+        self.ldapcnx.dap.modify_s (self.location, changes)
 
     def get_list (self, listnm):
         """Get the list of values stored under the given listnm.  If it is
-           not found, an empty list is returned.  The returned list is a
-           wrapper that will detect changes as part of an ongoing set of
-           changes, which will be deferred until overall synchronisation of
-           transaction state.
+           not found, an empty list is returned.  Call set_list_elem() to
+           update a stored value at any time.  The list holds attributes,
+           which are not wrapped in an application-specific class.
         """
-        assert (var in self.vars_lst)
+        assert (var in self.atnm_lst)
         if not self.loaded:
             self.load_vars ()
         return self.wrap_one [var]
+
+    def set_list_elem (self, listnm, oldval, newval):
+        """Set a list element value from oldval to newval.  Either of these
+           values can be None to indicate absense, so this function can
+           also be used to add and remove values in the list.
+           
+           Future spin-off functions may automatically respond to returned
+           lists by invoking this function, or a similar one, when a list
+           is edited.  By that time, this method name will be stripped from
+           any effect and its use will be deprecated or rejected.
+        """
+        changes = [ ]
+        if oldval is not None:
+            del self.attrvals [listnm] [oldval]
+            changes.append ( (ldap.MOD_DELETE, listnm, oldval) )
+        if newval is not None:
+            self.attrvals [listnm].append (newval)
+            changes.append ( (ldap.MOD_ADD,    listnm, newval) )
+        self.ldapcnx.dap.modify_s (self.location, changes)
 
     def child_location (self, varnm, value):
         """Get a child location under this one, where a given variable name
@@ -184,106 +399,85 @@ class NodeSyncLDAP (dict):
         assert (dnval_re.match (value))
         return varnm + '=' + value + ',' + self.location
 
-    def child_node (self, varnm, value):
+    def child_node (self, varnm, value, cls=None):
         """Get a child node under this one, where a given variable name and
            value serve as the key to identify the node.
+           The child node instantiates as an instance of cls, which defaults
+           to NodeSyncLDAP.
         """
+        assert (varnm_re.match (varnm))
+        assert (dnval_re.match (value))
+        if cls is None:
+            cls = NodeSyncLDAP
+        else:
+            assert (issubclass (cls, NodeSyncLDAP))
         chiloc = self.child_location (varnm, value)
-        obj = self.children.get (chiloc)
+        obj = self.children.get (chiloc, None)
         if obj is None:
-            obj = NodeSyncLDAP (self.master, self.child_location (varnm, value))
+            obj = cls (self.master, self.child_location (varnm, value))
             self.children [varnm + '=' + value] = obj
+        else:
+            assert (isinstance (obj, cls))
         return obj
 
-    def children (self, varnm):
+    def children (self, varnm, cls=None, classes=[], filterstr=None):
         """Get a dictionary of children under this one, each with the given
            variable name and some value.  The dictionary uses the value for
-           varnm as its keys and the NodeSyncLDAP as the keyed value.  As
+           varnm as its keys and instantiates cls for the keyed value.  As
            long as you hold on to this dictionary, or more accurately to its
            entries, you will be holding a copy in memory.  During that time,
            attempts to load the same node as a child of this one return the
            same object thanks to a weakref dictionary in here.  When you
            start changing values the nodes are also kept, pending the end of
            the transaction.
+           Child nodes instantiate as instances of cls, which defaults to
+           NodeSyncLDAP.
         """
-        #TODO# Share weak refs to existing nodes
-        #TODO# Load list from LDAP, turn each into NodeSyncLDAP objects
-        raise NotImplementedError ()
+        assert (varnm_re.match (varnm))
+        if cls is None:
+            cls = NodeSyncLDAP
+        else:
+            assert (issubclass (cls, NodeSyncLDAP))
+        if isinstance (classes, str):
+            classes = [classes]
+        classflt = '(&' + ''.join (
+                    [ '(objectClass=' + cls + ')' for cls in classes]
+                    ) + ')'
+        print ('DEBUG: classflt', classflt)
+        varnmflt = '(' + varnm  + '=*)'
+        print ('DEBUG: varnmflt', varnmflt)
+        combiflt = '(&' + classflt + varnmflt + (filterstr or '') + ')'
+        print ('DEBUG: combiflt', combiflt)
+        qr = self.ldapcnx.dap.search_s (self.location,
+                ldap.SCOPE_ONE,
+                attrlist=[varnm],
+                filterstr=combiflt)
+        print ('DEBUG: Query Result: %r' % qr)
+        retval = { }
+        for (dn, entry) in qr.items ():
+            var_is_val = dn.split (',') [0]
+            obj = self.children.get (var_is_val, None)
+            if obj is None:
+                obj = cls (self.master, dn)
+                self.children [var_is_val] = obj
+            else:
+                assert (isinstance (obj, cls))
+            for val in entry.get (varnm, []):
+                retval [val] = obj
+        return retval
 
-
-class ListSync (list):
-    """A list that synchronises with some backend, by sending it updates
-       to the update_elem() function, which is usually a method bound to
-       the sender or a sending context, with a first parameter with the
-       list name, and more to go from an old value (or None) to a new
-       value (or None).
-    """
-
-    def __init__ (self, listname, update_elem):
-        self.listname = listname
-        self.updater  = update_elem
-
-    def __add__ (self, ys):
-        for y in ys:
-            self.updater (self.listname, None, y)
-        list.__add__ (self, ys)
-
-    def __delslice__ (self, i, j):
-        for z in list.__getslice__ (i, j):
-            self.updater (self.listname, z, None)
-        list.__delslice__ (self, i)
-
-    def __setslice__ (self, i, j, ys):
-        for z in list.__getslice__ (i, j):
-            self.updater (self.listname, z, y)
-        list.__setitem__ (self, i, y)
-
-
-class SyncLDAP (object):
-    """SyncLDAP objects synchronise with LDAP, collecting changes until a
-       transaction commits.  At that time, any changes to the LDAP store
-       will be made one bit at a time.
-       
-       This service is implemented with elementary data that assumes a
-       link to the stored data.  Specifically, lists and dictionaries
-       may be edited as first-class Python objects but they will collect
-       LDAP modifications under the hood.  Such changes pile up and form
-       a transaction that can be committed (or rolled back) as a whole.
-       
-       The basic constructs provided here are:
-        * lists of objects directly under a given DN
-        * lists for attribute values at a given DN
-        * dictionaries parsed from lists of attributes at a given DN
-        
-       SyncLDAP instances are created to maintain one or more of these
-       constructs, always specific to a given LDAP connection.
-    """
-
-    def __init__ (self, ldapcnx, ispzone, service, userdomain=None):
-        """Wrap an LDAP connection to access a given service and optional
-           user domain.  You can get and set the user domain at any time,
-           but most data access functions assume that one has been setup.
-           The service is more like a static given; to switch between those,
-           you should create separate objects.
+    def resource_class (self):
+        """By default, NodeSyncLDAP is not a resource class in ACL terms,
+           but this may be overridden in an application-specific subclass.
+           It should then return a lowercase UUID string that was fixed
+           for this application.
         """
-        self.ldapcnx    = ldapcnx
-        self.ispzone    = ispzone
-        self.service    = service
-        self.set_userdomain (userdomain)
+        return None
 
-    def set_userdomain (self, userdomain):
-        self.userdomain = userdomain
-        self.basenode = None
-
-    def get_userdomain (self):
-        return self.userdomain
-
-    def base_location (self):
-        assert (self.userdomain is not None)
-        return 'associatedDomain=' + self.userdomain + ',ou=' + self.service + ',o=' + self.ispzone + ',ou=InternetWide'
-
-    def base_node (self, cls=NodeSyncLDAP):
-	assert (issubclass (cls, NodeSyncLDAP))
-        if self.basenode is None:
-            self.basenode = cls (self, self.base_location ())
-        return self.basenode
+    def resource_instance (self):
+        """By default, NodeSyncLDAP is not a resource instance in ACL terms,
+           but this may be overridden in an application-specific subclass.
+           It should then return the string notation that serves as the key
+           for the applicable resource class.
+        """
+        return None

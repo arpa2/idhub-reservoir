@@ -1,5 +1,5 @@
 
-__name__ = "arpa2.servicedir"
+__name__ = "arpa2.servicedit"
 
 __version__ = "0.0.0"
 
