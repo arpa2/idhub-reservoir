@@ -53,7 +53,7 @@ class Reservoir (WeakValueDictionary):
         if not self.uid:
             dn = self.baseDN
         else:
-            dn = 'uid=' + self.uid + ','  + self.baseDN
+            dn = 'uid=' + self.uid + ',ou=Users,'  + self.baseDN
 
     def home (self):
         """Return the Index node for this Reservoir.  When a username was

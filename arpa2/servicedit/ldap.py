@@ -116,9 +116,9 @@ class ConnectLDAP (object):
         self.login_gssapi (self.cfg_binddn ())
 
 
-class SyncLDAP (object):
-    """SyncLDAP objects synchronise with LDAP, and future versions may
-       collect changes in transactions.  SyncLDAP objects represent an
+class AppSyncLDAP (object):
+    """AppSyncLDAP objects synchronise with LDAP, and future versions may
+       collect changes in transactions.  AppSyncLDAP objects represent an
        LDAP object for a particular application, so they line up with
        a ServiceDIT object
        
@@ -132,8 +132,8 @@ class SyncLDAP (object):
        There can be multiple clients with this same connection at the
        same time, usually caused by separate attempts to operate on the
        same application.  All nodes underneath this one would normally
-       be NodeSyncLDAP instances, but probably as a subclass thereof.
-       In fact, SyncLDAP is commonly subclassed by applications too.
+       be DataSyncLDAP instances, but probably as a subclass thereof.
+       In fact, AppSyncLDAP is commonly subclassed by applications too.
     """
 
     def __init__ (self, ldapcnx, ispzone, service, basenodecls, userdomain=None):
@@ -180,9 +180,9 @@ class SyncLDAP (object):
     def base_node (self):
         """Return a Python object that references the ServiceDIT and share
            it with any other objects currently active for the same node and
-           requested through this same SyncLDAP instance.  The object made
+           requested through this same AppSyncLDAP instance.  The object made
            is an instance of the basenodecls that was provided during this
-           SyncLDAP initialisation.
+           AppSyncLDAP initialisation.
         """
         assert (self.userdomain is not None)
         basenode = self.dom2obj.get (self.userdomain, None)
@@ -192,7 +192,7 @@ class SyncLDAP (object):
         return basenode
 
     def resource_class (self):
-        """By default, SyncLDAP is not a resource class in ACL terms,
+        """By default, AppSyncLDAP is not a resource class in ACL terms,
            but this may be overridden in an application-specific subclass.
            It should then return a lowercase UUID string that was fixed
            for this application.
@@ -200,14 +200,14 @@ class SyncLDAP (object):
         return None
 
     def resource_instance (self):
-        """SyncLDAP sits too high up the ServiceDIT to ever be a resource
+        """AppSyncLDAP sits too high up the ServiceDIT to ever be a resource
            instance in ACL terms.  It should never return a key from this
            function, and subclasses should not override this either.
         """
-        raise Exception ('SyncLDAP objects can never be ACL resource instance')
+        raise Exception ('AppSyncLDAP objects cannot be ACL resource instance')
 
 
-class NodeSyncLDAP (dict):
+class DataSyncLDAP (dict):
     """Node Sync LDAP objects support the retrieval of attributes
        and sub-nodes.  A Node Sync LDAP object may be present in memory
        before it has been created, or after it has been deleted.
@@ -403,14 +403,14 @@ class NodeSyncLDAP (dict):
         """Get a child node under this one, where a given variable name and
            value serve as the key to identify the node.
            The child node instantiates as an instance of cls, which defaults
-           to NodeSyncLDAP.
+           to DataSyncLDAP.
         """
         assert (varnm_re.match (varnm))
         assert (dnval_re.match (value))
         if cls is None:
-            cls = NodeSyncLDAP
+            cls = DataSyncLDAP
         else:
-            assert (issubclass (cls, NodeSyncLDAP))
+            assert (issubclass (cls, DataSyncLDAP))
         chiloc = self.child_location (varnm, value)
         obj = self.children.get (chiloc, None)
         if obj is None:
@@ -431,13 +431,13 @@ class NodeSyncLDAP (dict):
            start changing values the nodes are also kept, pending the end of
            the transaction.
            Child nodes instantiate as instances of cls, which defaults to
-           NodeSyncLDAP.
+           DataSyncLDAP.
         """
         assert (varnm_re.match (varnm))
         if cls is None:
-            cls = NodeSyncLDAP
+            cls = DataSyncLDAP
         else:
-            assert (issubclass (cls, NodeSyncLDAP))
+            assert (issubclass (cls, DataSyncLDAP))
         if isinstance (classes, str):
             classes = [classes]
         classflt = '(&' + ''.join (
@@ -467,7 +467,7 @@ class NodeSyncLDAP (dict):
         return retval
 
     def resource_class (self):
-        """By default, NodeSyncLDAP is not a resource class in ACL terms,
+        """By default, DataSyncLDAP is not a resource class in ACL terms,
            but this may be overridden in an application-specific subclass.
            It should then return a lowercase UUID string that was fixed
            for this application.
@@ -475,7 +475,7 @@ class NodeSyncLDAP (dict):
         return None
 
     def resource_instance (self):
-        """By default, NodeSyncLDAP is not a resource instance in ACL terms,
+        """By default, DataSyncLDAP is not a resource instance in ACL terms,
            but this may be overridden in an application-specific subclass.
            It should then return the string notation that serves as the key
            for the applicable resource class.
