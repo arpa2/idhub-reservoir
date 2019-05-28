@@ -126,8 +126,8 @@ class AppSyncLDAP (object):
        
        Directly underneath is the level of user domains, and a current
        user domain can be maintained in this object as well as instances
-       created for each of those instances.  This results in a base
-       location that can be retrieved and for which nodes can be requested.
+       created for each of those instances.  This results in a base DN
+       that can be retrieved and for which nodes can be requested.
        
        There can be multiple clients with this same connection at the
        same time, usually caused by separate attempts to operate on the
@@ -136,21 +136,21 @@ class AppSyncLDAP (object):
        In fact, AppSyncLDAP is commonly subclassed by applications too.
     """
 
-    def __init__ (self, ldapcnx, ispzone, service, basenodecls, userdomain=None):
+    def __init__ (self, ldapcnx, ispzone, service, domcls, userdomain=None):
         """Wrap an LDAP connection to access a given service and optional
            user domain.  You can get and set the user domain at any time,
            but most data access functions assume that one has been setup.
            The service is more like a static given; to switch between those,
            you should create separate objects.
-           The base node class is the Python class that will be instantiated
-           to represent nodes for individual user domains.
+           The domain class is the Python class that will be instantiated
+           to represent associatedDomain= nodes for individual user domains.
         """
-        assert (isinstance (basenode, cls))
+        assert (isinstance (domcls, DataSyncLDAP))
         self.ldapcnx = ldapcnx
         self.ispzone = ispzone
         self.service = service
         self.dom2obj = weakref.WeakValueDictionary ()
-        self.basecls = basenodecls
+        self.basecls = domcls
         self.set_userdomain (userdomain)
 
     def set_userdomain (self, userdomain=None):
@@ -170,24 +170,30 @@ class AppSyncLDAP (object):
         """
         return self.userdomain
 
-    def base_location (self):
+    def domain_dn (self, userdomain=None):
         """Return the node in the ServiceDIT representing the current domain
            for the application setup when this object was initialised.
         """
-        assert (self.userdomain is not None)
-        return 'associatedDomain=' + self.userdomain + ',ou=' + self.service + ',o=' + self.ispzone + ',ou=InternetWide'
+        assert (self.userdomain or userdomain is not None)
+        return 'associatedDomain=' + (self.userdomain or userdomain) + ',ou=' + self.service + ',o=' + self.ispzone + ',ou=InternetWide'
 
-    def base_node (self):
+    def domain_node (self):
         """Return a Python object that references the ServiceDIT and share
            it with any other objects currently active for the same node and
            requested through this same AppSyncLDAP instance.  The object made
-           is an instance of the basenodecls that was provided during this
-           AppSyncLDAP initialisation.
+           is an instance of the domclas that was provided during this
+           AppSyncLDAP initialisation, and is meant to represent an LDAP
+           object associatedDomain= under the application's LDAP object.
+           The respective LDAP structure will be added to the returned
+           domain object, since it is part of the infra defined here, so
+           subclasses do not have to do this.
         """
         assert (self.userdomain is not None)
         basenode = self.dom2obj.get (self.userdomain, None)
         if basenode is None:
-            basenode = self.basecls (self, self.base_location ())
+            basenode = self.basecls (self, self, self.domain_dn ())
+            basenode.add_structure (classes=['domainRelatedObject'],
+                                    singular_attrs=['associatedDomain'])
             self.dom2obj [self.userdomain] = basenode
         return basenode
 
@@ -221,35 +227,64 @@ class DataSyncLDAP (dict):
        them in transactions.
     """
 
-    def __init__ (self, topnode, location):
-        self.master   = topnode
+    def __init__ (self, appinst, parent, location):
+        assert (isinstance (appinst, AppSyncLDAP))
+        assert (parent==appinst or isinstance (parent, NodeSyncLDAP))
+        self.appinst  = appinst
+        self.myparent = parent
         self.location = location
-        self.atnm_one = None
-        self.atnm_lst = None
+        self.atnm_one = set ()
+        self.atnm_lst = set ()
+        self.classlst = set ()
         self.attrvals = { }
         self.children = weakref.WeakValueDictionary ()
-        self.loaded  = False
-        self.created = False
+        self.loaded   = False
+        self.created  = False
 
-    def set_variables (self, singular_attrs=[], list_attrs=[]):
-        """Set the single-valued variables and list variabels that are of
-           interest in this node.  Loading them is deferred to later.
-           You must call this operation exactly once.  This is mostly done
+    def application (self):
+        """Return the AppSyncLDAP instance for this application.
+        """
+        return self.appinst
+
+    def parent (self):
+        """Return the DataSyncLDAP or AppSyncLDAP parent for this node.
+           Maintaining this link is important because of the hierarchy
+           of weak dictionaries; sub-nodes must be able to rely on their
+           parent nodes to continue to exist at least as long as they do.
+           This is the reason why we store this upward reference.
+        """
+        return self.myparent
+
+    def add_structure (self, classes=set(),
+                             singular_attrs=set(),
+                             multiple_attrs=set()):
+        """Add the single-valued variables and list variables that are of
+           interest in this node.  Loading them is deferred to later so
+           you can call this from various (sub)classes.
+           
+           You must call this operation at least once.  This is mostly done
            immediately after initialisation.  Most probably, it would be
            called from a subclass's initialisation, where the desired
            knowledge is available.
+           
+           The singular_attrs may be abused as an extra constraint on the
+           attribute, making them singular in an application even when the
+           LDAP structure allows multiple values.  This may raise exceptions
+           that the application needs to be aware of and handle, though this
+           could be avoided if the application is the only method of
+           altering LDAP.
         """
-        assert (self.atnm_one is None)
-        assert (self.atnm_lst is None)
         assert (not self.loaded)
+        assert (not self.created)
         for varnm in singular_attrs:
             assert (varnm_re.match (varnm))
         for varnm in list_attrs:
             assert (varnm_re.match (varnm))
-        self.atnm_one = singular_attrs
-        self.atnm_lst = list_attrs
+        self.atnm_one = self.atnm_one.union (singular_attrs)
+        self.atnm_lst = self.atnm_lst.union (list_attrs    )
+        self.classlst = self.classlst.union (class_list    )
 
-    def create (self, classes, attrs_dict):
+    def create (self, attrs_dict):
         """After preparing with set_variables, create a classes instance
            with attributes from atnm_dict.  For list_vars, an iteratable
            is expected to reveal all the attribute values.  Variables
@@ -264,9 +299,7 @@ class DataSyncLDAP (dict):
         assert (self.atnm_one is not None)
         assert (self.atnm_lst is not None)
         assert (self.loaded is False)
-        if isinstance (classes, str):
-            classes = [classes]
-        self.attrvals ['objectClass'] = classes [:]
+        self.attrvals ['objectClass'] = classlst
         rescls = self.resource_class ()
         if rescls is not None:
             self.attrvals ['resourceClassUUID'] = rescls
@@ -298,7 +331,7 @@ class DataSyncLDAP (dict):
         self.loaded  = False
         self.attrvals = { }
 
-    def load_vars (self, classes, filterstr=None):
+    def load_vars (self, filterstr=None):
         """Load the variabels as they are currently stored in LDAP.
            This should be called after initialisation, for objects
            that are not created from scratch.  Call set_variables
@@ -311,7 +344,7 @@ class DataSyncLDAP (dict):
         assert (self.atnm_lst is not None)
         atlist = self.atnm_one + self.atnm_lst
         classflt = '(&' + ''.join (
-                    [ '(objectClass=' + cls + ')' for cls in classes]
+                    [ '(objectClass=' + cls + ')' for cls in self.classlst]
                     ) + ')'
         print ('DEBUG: classflt', classflt)
         if filterstr is not None:
@@ -390,7 +423,7 @@ class DataSyncLDAP (dict):
             changes.append ( (ldap.MOD_ADD,    listnm, newval) )
         self.ldapcnx.dap.modify_s (self.location, changes)
 
-    def child_location (self, varnm, value):
+    def child_dn (self, varnm, value):
         """Get a child location under this one, where a given variable name
            and value serve as the key to identify the node.
         """
@@ -411,10 +444,10 @@ class DataSyncLDAP (dict):
             cls = DataSyncLDAP
         else:
             assert (issubclass (cls, DataSyncLDAP))
-        chiloc = self.child_location (varnm, value)
+        chiloc = self.child_dn (varnm, value)
         obj = self.children.get (chiloc, None)
         if obj is None:
-            obj = cls (self.master, self.child_location (varnm, value))
+            obj = cls (self.appinst, self, self.child_dn (varnm, value))
             self.children [varnm + '=' + value] = obj
         else:
             assert (isinstance (obj, cls))
@@ -458,7 +491,7 @@ class DataSyncLDAP (dict):
             var_is_val = dn.split (',') [0]
             obj = self.children.get (var_is_val, None)
             if obj is None:
-                obj = cls (self.master, dn)
+                obj = cls (self.appinst, self, dn)
                 self.children [var_is_val] = obj
             else:
                 assert (isinstance (obj, cls))
