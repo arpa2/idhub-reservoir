@@ -15,8 +15,9 @@
 # went into making the assertion statements readable as repair hints.
 
 
+import sys
 import weakref
-
+from os import environ
 import re
 
 import ldap
@@ -44,7 +45,7 @@ class ConnectLDAP (object):
         newcfg = { }
         try:
             for cfgln in open (ldap_conf_file, 'r').readlines ():
-                m = cfgln_re.match (cfln)
+                m = cfgln_re.match (cfgln)
                 if m is not None:
                     (key,val) = m.groups ()
                     newcfg [key] = val
@@ -62,6 +63,8 @@ class ConnectLDAP (object):
         if uri is None:
             sys.stderr.write ('ERROR: Unable to find ARPA2_LDAPURI envvar or URI in ldap configuration\n')
             sys.exit (1)
+        print ('DEBUG: LDAP URI is', uri)
+        return uri
 
     def cfg_binddn (self):
         """Retrieve the user DN as whom to bind/login to LDAP.  This may be
@@ -69,6 +72,7 @@ class ConnectLDAP (object):
            taken from the URI variable in the ldap_conf_file.
         """
         binddn = environ.get ('ARPA2_BINDDN', self.ldap_conf.get ('BINDDN'))
+        print ('BINDDN is', binddn)
         if binddn is not None:
             assert (binddn.endswith (',cn=gssapi,cn=auth'))
         else:
@@ -145,7 +149,8 @@ class AppSyncLDAP (object):
            The domain class is the Python class that will be instantiated
            to represent associatedDomain= nodes for individual user domains.
         """
-        assert (isinstance (domcls, DataSyncLDAP))
+        print ('DEBUG: Domain Class is', domcls)
+        assert (issubclass (domcls, DataSyncLDAP))
         self.ldapcnx = ldapcnx
         self.ispzone = ispzone
         self.service = service
@@ -174,10 +179,10 @@ class AppSyncLDAP (object):
         """Return the node in the ServiceDIT representing the current domain
            for the application setup when this object was initialised.
         """
-        assert (self.userdomain or userdomain is not None)
-        return 'associatedDomain=' + (self.userdomain or userdomain) + ',ou=' + self.service + ',o=' + self.ispzone + ',ou=InternetWide'
+        assert ((userdomain or self.userdomain) is not None)
+        return 'associatedDomain=' + (userdomain or self.userdomain) + ',ou=' + self.service + ',o=' + self.ispzone + ',ou=InternetWide'
 
-    def domain_node (self):
+    def domain_node (self, userdomain=None):
         """Return a Python object that references the ServiceDIT and share
            it with any other objects currently active for the same node and
            requested through this same AppSyncLDAP instance.  The object made
@@ -188,13 +193,15 @@ class AppSyncLDAP (object):
            domain object, since it is part of the infra defined here, so
            subclasses do not have to do this.
         """
-        assert (self.userdomain is not None)
-        basenode = self.dom2obj.get (self.userdomain, None)
+        if userdomain is None:
+            userdomain = self.userdomain
+        assert (userdomain is not None)
+        basenode = self.dom2obj.get (userdomain, None)
         if basenode is None:
-            basenode = self.basecls (self, self, self.domain_dn ())
+            basenode = self.basecls (self, self, self.domain_dn (userdomain=userdomain))
             basenode.add_structure (classes=['domainRelatedObject'],
                                     singular_attrs=['associatedDomain'])
-            self.dom2obj [self.userdomain] = basenode
+            self.dom2obj [userdomain] = basenode
         return basenode
 
     def resource_class (self):
@@ -214,8 +221,8 @@ class AppSyncLDAP (object):
 
 
 class DataSyncLDAP (dict):
-    """Node Sync LDAP objects support the retrieval of attributes
-       and sub-nodes.  A Node Sync LDAP object may be present in memory
+    """Data Sync LDAP objects support the retrieval of attributes
+       and sub-nodes.  A Data Sync LDAP object may be present in memory
        before it has been created, or after it has been deleted.
        
        These objects can change attribute values, search for children,
@@ -229,7 +236,7 @@ class DataSyncLDAP (dict):
 
     def __init__ (self, appinst, parent, location):
         assert (isinstance (appinst, AppSyncLDAP))
-        assert (parent==appinst or isinstance (parent, NodeSyncLDAP))
+        assert (parent==appinst or isinstance (parent, DataSyncLDAP))
         self.appinst  = appinst
         self.myparent = parent
         self.location = location
@@ -278,18 +285,18 @@ class DataSyncLDAP (dict):
         assert (not self.created)
         for varnm in singular_attrs:
             assert (varnm_re.match (varnm))
-        for varnm in list_attrs:
+        for varnm in multiple_attrs:
             assert (varnm_re.match (varnm))
         self.atnm_one = self.atnm_one.union (singular_attrs)
-        self.atnm_lst = self.atnm_lst.union (list_attrs    )
-        self.classlst = self.classlst.union (class_list    )
+        self.atnm_lst = self.atnm_lst.union (multiple_attrs)
+        self.classlst = self.classlst.union (classes       )
 
     def create (self, attrs_dict):
-        """After preparing with set_variables, create a classes instance
-           with attributes from atnm_dict.  For list_vars, an iteratable
+        """After preparing with add_structure, create a classes instance
+           with attributes from attrs_dict.  For multipe_attrs, an iteratable
            is expected to reveal all the attribute values.  Variables
            not set during creation will not be created at all; there are
-           no default values but absense.
+           no default values other than absense.
            
            This will also make calls to the methods resource_class()
            and resource_instance() to see if these have been overridden

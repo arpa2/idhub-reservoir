@@ -16,6 +16,8 @@ uuid_re = re.compile ('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 idxe_re = re.compile ('^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?: ([ -~]+))?$')
 cldn_re = re.compile ('^resins=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}),associatedDomain=')
 rsdn_re = re.compile ('^documentIdentifier=([^,]+),resins=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}),associatedDomain=')
+asdo_re = re.compile ('^associatedDomain=([^,]+),ou=Reservoir,')
+usrd_re = re.compile ('^uid=([^,]+),ou=Users,associatedDomain=([^,]+),ou=Reservoir,')
 
 
 class Reservoir (AppSyncLDAP):
@@ -33,7 +35,7 @@ class Reservoir (AppSyncLDAP):
        ServiceDIT as a means of indexing it.
     """
     def __init__ (self, ldapcnx, userdomain=None):
-        AppSyncLDAP.__init__ (self, 'arpa2.net', 'Reservoir', Domain, userdomain=None)
+        AppSyncLDAP.__init__ (self, ldapcnx, 'arpa2.net', 'Reservoir', Domain, userdomain)
 
 
 class Index (DataSyncLDAP):
@@ -46,7 +48,9 @@ class Index (DataSyncLDAP):
 
        Because Collections are always Indexes, it is possible to walk
        a path to an eventual Resource, even if the structure of the
-       stored data in LDAP has a flatter structure.
+       stored data in LDAP has a flatter structure.  Individual steps
+       can also be made, to migrate from an Index to a Collection,
+       which in turn is an Index.  A walk is a sequence of steps.
        
        Indexes are also the home to many user-issued management commands;
        for instance, the change or removal of a name or the creation of a
@@ -64,7 +68,8 @@ class Index (DataSyncLDAP):
         """Return an Index object for the given DN.
         """
         assert (isinstance (resv, Reservoir))
-        DataSyncLDAP (self, resv, parent, dn)
+        print ('DataSyncLDAP.__init is', DataSyncLDAP.__init__, '::', type (DataSyncLDAP.__init__))
+        DataSyncLDAP.__init__ (self, resv, parent, dn)
         self.add_structure (classes=set (['resourceIndex']),
                             multiple_attrs=['collectionRef', 'reservoirRemoteRef'],
                             singular_attrs=['resins'])
@@ -160,6 +165,19 @@ class Index (DataSyncLDAP):
         assert (coll_name is None or step_re.match (coll_name))
         coll_uuid = self.index [coll_name]
         return self.appinst.collection (self, coll_uuid)
+
+    def step (self, name):
+        """Take a step from the current Index, traversing the name
+           to find a Collection.  This Collection is once more an
+           Index, so another step may be taken from there on.  See
+           the walk() method for a sequence of steps with some
+           extra utilities.
+        """
+        assert (step_re.match (name))
+        next = get_index_entry (name)
+        if next is None:
+            raise Exception ('Unable to take the step %s' % (name,))
+        return next
 
     def walk (self, path, res_name=None, maybe_res=False):
         """Walk down a path from the current Index, and return the
@@ -257,6 +275,11 @@ class Domain (Index):
             self.users = self.child_node ('ou', 'Users')
         return self.users
 
+    def domain (self):
+        """Return the domain name for this Reservoir Domain object.
+        """
+        return asdo_re.match (self.location).group (1)
+
     def home_dn (self, username=None):
         """Return the home DN for this Reservoir.  When a username is
            given, this produces the starting DN for the user.  If not,
@@ -264,10 +287,12 @@ class Domain (Index):
            just this object itself).
         """
         if username is None:
-            dn = self.baseDN
+            print ('Returning baseDN as home_dn')
+            return self.baseDN
         else:
             assert (user_re.match (username))
-            dn = 'uid=' + self.uid + ',ou=Users,'  + self.baseDN
+            print ('Returning user node as home_dn')
+            return 'uid=' + username + ',ou=Users,'  + self.baseDN
 
     def home (self, username=None):
         """Return the Index node for this Reservoir.  When a username is
@@ -284,7 +309,7 @@ class Domain (Index):
         else:
             assert (user_re.match (username))
             users = self._have_users_node ()
-            return self.child_node ('uid', username, DomainUser)
+            return users.child_node ('uid', username, DomainUser)
 
     def collection_dn (self, coll_uuid):
         """Return the DN for a given lowercase UUID representing a
@@ -313,8 +338,19 @@ class Domain (Index):
            Reservoir.
         """
         coll = self.collection (coll_uuid)
-        #TODO# Maybe reference the Collection from the Resource?
+        # The Resource will be aware of this object, as its parent
         return self.child_node ('cn', res_name, Resource)
+
+    def create_collection (self):
+        """Create a new Collection.  The returned object is only
+           present in memory, but its identity is a unique value,
+           namely a random UUID (type 4), so clashes are not
+           perceivable.  The returned Collection is not connected
+           to anything, so dropping it has no impact (yet).
+        """
+        coluuid = str (uuid.uuid4 ())
+        coldn = 'resins=%s,%s' % (coluuid, self.location)
+        return Collection (self.appinst, self, coldn)
 
 
 class DomainUser (DataSyncLDAP):
@@ -328,11 +364,18 @@ class DomainUser (DataSyncLDAP):
     """
 
     def __init__ (self, resv, parent, dn):
+        print ('DEBUG: parent^1 =', parent, '::', type (parent))
+        print ('DEBUG: parent^2 =', parent.parent (), '::', type (parent.parent ()))
         assert (isinstance (resv, Reservoir))
         assert (isinstance (parent.parent (), Domain))
         DataSyncLDAP.__init__ (self, resv, parent, dn)
         self.add_structure (classes=['uidObject'],
                             singular_attrs=['uid'])
+
+    def user_at_domain (self):
+        """Return the domain name for this Reservoir Domain object.
+        """
+        return '%s@%s' % usrd_re.match (self.location).groups ()
 
 
 class Collection (Index):
@@ -375,6 +418,16 @@ class Collection (Index):
     def resource_instance (self):
         """Return the ACL resource instance as a lowercase UUID
            with the resins value in the RDN for this Collection.
+        """
+        return self.uuid
+
+    def collection_dn (self):
+        """Return the DN that identifies this Collection.
+        """
+        return self.location
+
+    def collection_uuid (self):
+        """Return the UUID that identifies this Collection.
         """
         return self.uuid
 
@@ -452,6 +505,19 @@ class Collection (Index):
             wrong = self.access_desciption (wrong)
             raise Exception ('Access denied for ' + wrong)
 
+    def create_resource (self, docid):
+        """Create a Resource instance within this Collection.
+           The newly created object is not stored in LDAP yet,
+           so it requires a save to LDAP before it is certain
+           that the docid is unique and new.  Before that time,
+           it is possible to manipulate the object's variables.
+        """
+        #TODO# Escape special characters
+        assert (',' not in docid)
+        resdn = 'documentIdentifier=%s,%s' % (docid, self.location)
+        return Resource (self.appinst, self, resdn)
+
+
 class Resource (DataSyncLDAP):
     """Resources are nodes in the LDAP tree of Reservoir that
        represent files and their metadata.  The actual contents
@@ -480,7 +546,7 @@ class Resource (DataSyncLDAP):
         assert (isinstance (parent, Collection))
         dn_proper_for_resource = rsdn_re.match (dn)
         assert (dn_proper_for_resource)
-        DataSyncLDAP (self, resv, parent, dn)
+        DataSyncLDAP.__init__ (self, resv, parent, dn)
         (res_docid, coll_uuid) = dn_proper_for_resource.groups ()
         self.coll = coll_uuid
         self.docid = res_docid
@@ -503,3 +569,24 @@ class Resource (DataSyncLDAP):
         """
         self.access_require ('d')
         self.created = False
+
+    def collection (self):
+        """Return the Collection to which this Resource belongs.
+        """
+        return self.parent
+
+    def collection_uuid (self):
+        """Return the UUID of the Collection holding this
+           Resource.
+        """
+        return self.coll
+
+    def resource_docid (self):
+        """Return the docid that identifies this Resource.
+        """
+        return self.docid
+
+    def resource_dn (self):
+        """Return the DN for this Resource.
+        """
+        return self.location

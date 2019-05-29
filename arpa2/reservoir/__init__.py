@@ -1,7 +1,7 @@
 
-__version__ = "0.0.0"
+__version__ = "0.0.1"
 
 __name__ = "arpa2.reservoir"
 
-from arpa2.reservoir.node import *
+from arpa2.reservoir.nodes import *
 
